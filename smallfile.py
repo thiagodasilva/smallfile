@@ -36,6 +36,9 @@ from logging import DEBUG
 import threading
 import socket
 import errno
+import stat
+from gluster import gfapi
+import loremipsum
 
 OK = 0  # system call return code for success
 NOTOK = 1
@@ -101,44 +104,91 @@ class SMFResultException(Exception):
   def __str__(self):
     return self.msg
 
+def setup_gfapi(gfvol=None):
+    import sys, traceback
+    if gfvol is None:
+        gfvol = gfapi.Volume("sfhost", "test2")
+        gfvol.set_logging("/root/gflog", 7)
+        gfvol.mount()
+    return gfvol
+
+def gf_isdir(gfvol, path):
+    gfvol = setup_gfapi(gfvol)
+    s = gfvol.lstat(path)
+    if stat.S_ISDIR(s.st_mode):
+        return True
+    else:
+        return False
+            
+def gf_exists(gfvol, path):
+    gfvol = setup_gfapi(gfvol)
+    try:
+        gfvol.lstat(path)
+        return True
+    except OSError as e:
+        return False
+
+def gf_listdir(gfvol, path):
+    gfvol = setup_gfapi(gfvol)
+    fd = gfvol.opendir(path)
+    ent_list = []
+    while True:
+        ent = fd.next()
+        if not isinstance(ent, gfapi.Dirent):
+            break
+        name = ent.d_name[:ent.d_reclen]
+        ent_list.append(name)
+    return ent_list
+
 # avoid exception if file we wish to delete is not there
 
-def ensure_deleted(fn):
+def ensure_deleted(fn, gfvol=None):
+    gfvol = setup_gfapi(gfvol)
     try:
-      if os.path.lexists(fn): os.unlink(fn)
+      #if os.path.exists(fn): os.unlink(fn)
+      if gfvol.lstat(fn): gfvol.unlink(fn)
     except Exception as e:
       # could be race condition with other client processes/hosts
-      if os.path.exists(fn): # if was race condition, file will no longer be there
+      #if os.path.exists(fn): # if was race condition, file will no longer be there
+      if gf_exists(gfvol, fn):
          raise Exception("exception while ensuring %s deleted: %s"%(fn, str(e)))
 
 # just create an empty file
 # leave exception handling to caller
 
-def touch(fn):
-    with open(fn, "w") as f: pass
+def touch(fn, gfvol=None):
+    gfvol = setup_gfapi(gfvol)
+    try:
+        with gfvol.creat(fn, os.O_WRONLY | os.O_EXCL, 0644) as fd: pass
+    except Exception as e:
+        raise Exception("failed to create file: %s, error %s" % (fn, str(e)))
 
 # abort routine just cleans up threads
 
-def abort_test(abort_fn, thread_list):
-    if not os.path.exists(abort_fn): 
-        touch(abort_fn)
+def abort_test(abort_fn, thread_list, gfvol=None):
+    gfvol = setup_gfapi(gfvol)
+    #if not os.path.exists(abort_fn): 
+    if not gf_exists(gfvol, abort_fn):
+        touch(abort_fn, gfvol)
 
 # create directory if it's not already there
 
-def ensure_dir_exists( dirpath ):
-    if not os.path.exists(dirpath):
+def ensure_dir_exists(dirpath, gfvol=None):
+    gfvol = setup_gfapi(gfvol)
+    if dirpath == "/": return
+    if not gf_exists(gfvol, dirpath):
         parent_path = os.path.dirname(dirpath)
         if parent_path == dirpath:
             raise Exception('ensure_dir_exists: cannot obtain parent path of non-existent path: ' + dirpath)
-        ensure_dir_exists(parent_path)
+        ensure_dir_exists(parent_path, gfvol)
         try:
-            os.mkdir(dirpath)
-        except os.error as e:
+            gfvol.mkdir(dirpath, 0777)
+        except OSError as e:
             if e.errno != errno.EEXIST: # workaround for filesystem bug
                 raise e
     else:
-        if not os.path.isdir(dirpath):
-            raise Exception("%s already exists and is not a directory!"%dirpath)
+        if not gf_isdir(gfvol, dirpath):
+            raise Exception("%s already exists and is not a directory!" % dirpath)
 
 def get_hostname(h):
   if h == None: h = socket.gethostname()
@@ -181,7 +231,7 @@ class smf_invocation:
     filesize_distr_random_exponential = 0 # a file size distribution type
     random_size_limit = 8 # multiply mean size by this to get max file size
     if tmp_dir == None: tmp_dir = os.getenv("TEMP") # windows case
-    if tmp_dir == None: tmp_dir = "/var/tmp"  # assume POSIX-like
+    if tmp_dir == None: tmp_dir = "/tmp"  # assume POSIX-like
     some_prime = 900593
 
     # build largest supported buffer, and fill it full of random hex digits, then
@@ -191,6 +241,8 @@ class smf_invocation:
     random_seg_size_bits = 10
     biggest_buf_size = 1 << biggest_buf_size_bits
     buf_offset_range = 1 << 10  # this allows us to initialize files with up to this many different random patterns
+    gfvol = None
+
 
     # constructor sets up initial, default values for test parameters
 
@@ -233,6 +285,7 @@ class smf_invocation:
         self.biggest_buf = None       # generate from here on writes, compare to here on reads
         self.randstate = random.Random()
         self.reset()
+        self.gfvol = None
 
     # copy constructor
 
@@ -268,6 +321,7 @@ class smf_invocation:
         new.log_to_stderr = s.log_to_stderr
         new.verbose = s.verbose
         new.log_level = s.log_level
+        new.gfvol = s.gfvol
         new.log = None
         new.tid = None
         new.randstate = random.Random()
@@ -389,13 +443,13 @@ class smf_invocation:
     def save_rsptimes(self):
         fname = 'rsptimes_'+str(self.tid)+'_'+get_hostname(None)+'_'+self.opname+'_'+str(self.start_time)+'.csv'
         rsptime_fname = join(self.network_dir, fname)
-        with open(rsptime_fname, "w") as f:
-          for (opname, start_time, rsp_time) in self.rsptimes:
-            # time granularity is microseconds, accuracy is probably less than that
-            start_time_str = '%9.6f'%(start_time - self.start_time)
-            rsp_time_str = '%9.6f'%rsp_time
-            f.write( '%8s, %9.6f, %9.6f\n'%(opname, (start_time - self.start_time),rsp_time))
-          os.fsync(f.fileno()) # particularly for NFS this is needed
+        with self.gfvol.creat(rsptime_fname, os.O_WRONLY | os.O_EXCL, 0644) as f:
+            for (opname, start_time, rsp_time) in self.rsptimes:
+                # time granularity is microseconds, accuracy is probably less than that
+                start_time_str = '%9.6f'%(start_time - self.start_time)
+                rsp_time_str = '%9.6f'%rsp_time
+                f.write( '%8s, %9.6f, %9.6f\n'%(opname, (start_time - self.start_time),rsp_time))
+            f.fsync() # particularly for NFS this is needed
 
     # determine if test interval is over for this thread
 
@@ -425,7 +479,8 @@ class smf_invocation:
     # log file for this worker thread goes here
 
     def log_fn(self):
-        return join(self.tmp_dir, 'invoke_logs-%s.log'%self.tid)
+        #return join(self.tmp_dir, 'invoke_logs-%s.log'%self.tid)
+        return join("/var/log", 'invoke_logs-%s.log'%self.tid)
 
     # file for result stored as pickled python object
 
@@ -438,20 +493,23 @@ class smf_invocation:
     # what file size is for thread T's file j without having to stat the file
 
     def init_random_seed(self):
+      self.log.info('init_random_seed')
       if self.filesize_distr == self.filesize_distr_fixed: return
       fn = self.gen_thread_ready_fname(self.tid, hostname=self.onhost) + '.seed'
       thread_seed = str(time.time())
       self.log.debug('seed opname: '+self.opname)
       if self.opname == 'create' or self.opname == 'swift-put':
           thread_seed = str(time.time()) + ' ' + self.tid
-          ensure_deleted(fn)
-          with open(fn, "w") as seedfile:
-            seedfile.write(str(thread_seed))
-            self.log.debug('write seed %s '%thread_seed)
+          ensure_deleted(fn, self.gfvol)
+          with self.gfvol.creat(fn, os.O_CREAT|os.O_EXCL|os.O_WRONLY|O_BINARY, 0644) as seedfile:
+              seedfile.write(str(thread_seed))
+              self.log.debug('write seed %s '%thread_seed)
       elif self.opname == 'append' or self.opname == 'read' or self.opname == 'swift-get':
-          with open(fn, "r") as seedfile:
-            thread_seed = seedfile.readlines()[0].strip()
-            self.log.debug('read seed %s '%thread_seed)
+          with self.gfvol.open(fn, os.O_RDONLY) as seedfile:
+              #thread_seed = seedfile.readlines()[0].strip()
+              #TODO fix read
+              thread_seed = seedfile.read(128)
+              self.log.debug('read seed %s '%thread_seed)
       self.randstate.seed(thread_seed)
 
     def get_next_file_size(self):
@@ -475,10 +533,9 @@ class smf_invocation:
     def wait_for_gate(self):
         if self.starting_gate:
             gateReady = self.gen_thread_ready_fname(self.tid)
-            #print 'thread at gate, file ' + gateReady
-            touch(gateReady)
-            while not os.path.exists(self.starting_gate):
-                if os.path.exists(self.abort_fn()): raise Exception("thread " + str(self.tid) + " saw abort flag")
+            touch(gateReady, self.gfvol)
+            while not gf_exists(self.gfvol, self.starting_gate):
+                if gf_exists(self.gfvol, self.abort_fn()): raise Exception("thread " + str(self.tid) + " saw abort flag")
                 # wait a little longer so that other clients have time to see that gate exists
                 time.sleep(0.3)
 
@@ -488,9 +545,9 @@ class smf_invocation:
         self.rq_final = self.rq
         self.filenum_final = self.filenum
         self.end_time = time.time()
-        if self.filenum >= self.iterations and not os.path.exists(self.stonewall_fn()):
+        if self.filenum >= self.iterations and not gf_exists(self.gfvol, self.stonewall_fn()):
          try:
-            touch(self.stonewall_fn())
+            touch(self.stonewall_fn(), self.gfvol)
             self.log.info('stonewall file written by thread %s on host %s'%(self.tid, get_hostname(None)))
          except IOError as e:
             err = e.errno
@@ -508,9 +565,10 @@ class smf_invocation:
     
     def do_another_file(self):
         if self.stonewall and (self.filenum % self.files_between_checks == 0):
-                if (not self.test_ended()) and (os.path.exists(self.stonewall_fn())):
-                    self.log.info("stonewalled after " + str(self.filenum) + " iterations")
-                    self.end_test()
+            if (not self.test_ended()) and (gf_exists(self.gfvol, self.stonewall_fn())):
+                 self.log.info("stonewalled after " + str(self.filenum) + " iterations")
+                 self.end_test()
+
         # if user doesn't want to finish all requests and test has ended, stop
         if (not self.finish_all_rq) and self.test_ended():
             return False
@@ -597,6 +655,13 @@ class smf_invocation:
     # we generate a random byte sequence of 2^random_seg_size_bits in length
     # and then repeat the sequence until we get to size 2^biggest_buf_size_bits in length
 
+    def create_biggest_buf2(self, contents_random):
+        biggest_buf = ' '.join(loremipsum.get_sentences(50))
+        while len(biggest_buf) < self.total_sz_kb * self.BYTES_PER_KB:
+            biggest_buf = biggest_buf + biggest_buf
+        return biggest_buf
+
+
     def create_biggest_buf(self, contents_random):
 
       # generate random byte sequence if desired.
@@ -622,7 +687,12 @@ class smf_invocation:
 
     # allocate buffer of correct size with offset based on filenum, tid, etc.
 
+    def prepare_buf2(self):
+        self.log.info("prepare_buf")
+        self.buf = self.biggest_buf
+
     def prepare_buf(self):
+        self.log.info("prepare_buf")
 
         # determine max record size of I/Os
 
@@ -678,20 +748,22 @@ class smf_invocation:
         if (self.tid != '00') and self.is_shared_dir: return
         dirset=set()
         for tree in [ self.src_dirs, self.dest_dirs ]:
-          if self.hash_to_dir: dir_range = range(0, self.iterations + 1)
-          else: dir_range = range(0, self.iterations + self.files_per_dir, self.files_per_dir)
-          for j in dir_range:
-            fpath = self.mk_file_nm(tree, j)
-            dpath = os.path.dirname(fpath)
-            dirset.add(dpath)
+            if self.hash_to_dir: dir_range = range(0, self.iterations + 1)
+            else: dir_range = range(0, self.iterations + self.files_per_dir, self.files_per_dir)
+            for j in dir_range:
+                fpath = self.mk_file_nm(tree, j)
+                dpath = os.path.dirname(fpath)
+                dirset.add(dpath)
         for unique_dpath in dirset:
-            if exists(abort_filename): break
-            if not exists(unique_dpath): 
-              try:
-                os.makedirs(unique_dpath, 0o777)
-              except OSError as e:
-                if not ((e.errno == errno.EEXIST) and self.is_shared_dir):
-                  raise e
+            if gf_exists(self.gfvol, abort_filename): break
+            if not gf_exists(self.gfvol, unique_dpath): 
+                try:
+                    self.log.debug('mkdir: %s' % unique_dpath)
+            	    #self.gfvol.mkdir(unique_dpath, 0777)
+                    ensure_dir_exists(unique_dpath, self.gfvol)
+                except OSError as e:
+                    if not ((e.errno == errno.EEXIST) and self.is_shared_dir):
+                        raise e
 
 
     # clean up all subdirectories
@@ -701,66 +773,69 @@ class smf_invocation:
         if (self.tid != '00') and self.is_shared_dir: return
         dirset=set()
         for tree in [ self.src_dirs, self.dest_dirs ]:
-          if self.hash_to_dir: dir_range = range(0, self.iterations + 1)
-          else: dir_range = range(0, self.iterations + self.files_per_dir, self.files_per_dir)
-          for j in dir_range:
-            fpath = self.mk_file_nm(tree, j)
-            dpath = os.path.dirname(fpath)
-            dirset.add(dpath)
+            if self.hash_to_dir: dir_range = range(0, self.iterations + 1)
+            else: dir_range = range(0, self.iterations + self.files_per_dir, self.files_per_dir)
+            for j in dir_range:
+                fpath = self.mk_file_nm(tree, j)
+                dpath = os.path.dirname(fpath)
+                dirset.add(dpath)
         for unique_dpath in dirset:
             while len(unique_dpath) > 10:  # FIXME: arbitrary, but don't try to delete directories at very top
-                if not exists(unique_dpath):
-                        unique_dpath = os.path.dirname(unique_dpath)
-                        continue
+                if not gf_exists(self.gfvol, unique_dpath):
+                    unique_dpath = os.path.dirname(unique_dpath)
+                    continue
                 else:
-                        try:
-                          #print('removing dir '+unique_dpath)
-                          os.rmdir(unique_dpath)
-                        except OSError as e:
-                          if (e.errno == errno.ENOTEMPTY): break
-                          if (e.errno == errno.EACCES): break
-                          if (e.errno == errno.EBUSY): break  # might be mountpoint directory
-                          self.log.error('deleting directory dpath: %s'%e)
-                          if (e.errno != errno.ENOENT) and not self.is_shared_dir: raise e
-                        unique_dpath = os.path.dirname(unique_dpath)
-                        if len(unique_dpath) <= len(self.src_dirs[0]):
-                                break
+                    try:
+                        self.gfvol.rmdir(unique_dpath)
+                    except OSError as e:
+                        if (e.errno == errno.ENOTEMPTY): break
+                        if (e.errno == errno.EACCES): break
+                        if (e.errno == errno.EBUSY): break  # might be mountpoint directory
+                        self.log.error('deleting directory dpath: %s'%e)
+                        if (e.errno != errno.ENOENT) and not self.is_shared_dir: raise e
+                    unique_dpath = os.path.dirname(unique_dpath)
+                    if len(unique_dpath) <= len(self.src_dirs[0]):
+                        break
 
     # operation-specific test code goes in do_<opname>()
         
     def do_create(self):
+        self.log.info('do_create')
         while self.do_another_file():
             fn = self.mk_file_nm(self.src_dirs)
             self.op_starttime()
             fd = -1
             try: 
-              fd = os.open( fn, os.O_CREAT|os.O_EXCL|os.O_WRONLY|O_BINARY )
-              if (fd < 0):
-                raise MFRdWrExc(self.opname, self.filenum, 0, 0)
-              remaining_kb = self.get_next_file_size()
-              self.prepare_buf()
-              rszkb = self.get_record_size_to_use()
-              while remaining_kb > 0:
-                if remaining_kb*self.BYTES_PER_KB < len(self.buf): 
-                  rszbytes = remaining_kb * self.BYTES_PER_KB
-                  written = os.write(fd, self.buf[0:rszbytes])
-                else:
-                  rszbytes = len(self.buf)
-                  written = os.write(fd, self.buf)
-                if written != rszbytes:
-                    raise MFRdWrExc(self.opname, self.filenum, self.rq, written)
-                self.rq += 1
-                remaining_kb -= (rszbytes/self.BYTES_PER_KB)
+              self.log.debug('do_create: %s' % fn)
+              with self.gfvol.creat(fn, os.O_CREAT|os.O_EXCL|os.O_WRONLY|O_BINARY, 0644) as fd:
+                  #if (fd < 0):
+		              #raise MFRdWrExc(self.opname, self.filenum, 0, 0)
+                  remaining_kb = self.get_next_file_size()
+                  self.prepare_buf()
+                  rszkb = self.get_record_size_to_use()
+                  while remaining_kb > 0:
+                      if remaining_kb*self.BYTES_PER_KB < len(self.buf): 
+                          rszbytes = remaining_kb * self.BYTES_PER_KB
+                          written = fd.write(self.buf[0:rszbytes])
+                      else:
+                          rszbytes = len(self.buf)
+                          written = fd.write(self.buf)
+                      if written != rszbytes:
+                          raise MFRdWrExc(self.opname, self.filenum, self.rq, written)
+                      self.rq += 1
+                      remaining_kb -= (rszbytes/self.BYTES_PER_KB)
+
+                  if self.fsync: fd.fsync()
             except OSError as e:
-              if (e.errno == errno.ENOENT) and self.dirs_on_demand:  # if directory doesn't exist
-                os.makedirs(os.path.dirname(fn))
-                self.filenum -= 1  # retry this file now that its directory exists
-                continue
-              raise e
-            finally:
-              if fd >= 0: 
-                if self.fsync: os.fsync(fd)
-                os.close(fd)
+                self.log.exception(e)
+                if (e.errno == errno.ENOENT) and self.dirs_on_demand:  # if directory doesn't exist
+                    self.gfvol.mkdir(os.path.dirname(fn), 0777)
+                    self.filenum -= 1  # retry this file now that its directory exists
+                    continue
+            #finally:
+              #if fd >= 0: 
+              #  if self.fsync: os.fsync(fd)
+              #  os.close(fd)
             self.op_endtime(self.opname)
 
     def do_mkdir(self):
@@ -1106,20 +1181,24 @@ class smf_invocation:
             fn = basenm + self.rename_suffix
             ensure_deleted(fn)
             dir = basenm + '.d'
-            if os.path.exists(dir):
-              os.rmdir(dir)
+            if gf_exists(self.gfvol, dir):
+                self.gfvol.rmdir(dir)
         self.clean_all_subdirs()
         self.stonewall = save_stonewall
         self.finish_all_rq = save_finish
         self.status = ok
 
+
+ 
     def do_workload(self):
         self.reset()
         for j in range(0, self.iterations+self.files_per_dir):
             self.file_dirs.append(self.mk_dir_name(j))
         self.start_log()
         self.log.info('do_workload: ' + str(self))
-        ensure_dir_exists(self.network_dir)
+        self.gfvol = setup_gfapi()
+        ensure_dir_exists(self.tmp_dir, self.gfvol)
+        ensure_dir_exists(self.network_dir, self.gfvol)
         if self.opname == "create" or self.opname == "mkdir" or self.opname == "swift-put": 
             self.make_all_subdirs()
         self.init_random_seed()
@@ -1149,6 +1228,8 @@ class smf_invocation:
         if self.filenum != self.iterations: self.log.info("recorded throughput after " + str(self.filenum) + " files")
         if self.rq_final < 0: self.end_test()
         self.elapsed_time = self.end_time - self.start_time
+        self.gfvol = None
+        time.sleep(1.1)
         # this next call works fine with python 2.7 but not with python 2.6, why?
         #logging.shutdown()
         return self.status

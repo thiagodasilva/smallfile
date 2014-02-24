@@ -36,18 +36,19 @@ def run_multi_thread_workload(prm):
   prm_slave = prm.is_slave
   verbose = master_invoke.verbose
   host = master_invoke.onhost
+  gfvol = smallfile.setup_gfapi()
 
   if not prm_slave:
       sync_files.create_top_dirs(master_invoke, False)
 
   if prm_slave:
     time.sleep(1.1)
-    for d in master_invoke.top_dirs: ensure_dir_exists(d)
-    os.listdir(master_invoke.network_dir)
+    for d in master_invoke.top_dirs: ensure_dir_exists(d, gfvol)
+    smallfile.gf_listdir(gfvol, master_invoke.network_dir)
     for dlist in [ master_invoke.src_dirs, master_invoke.dest_dirs ]:
       for d in dlist:
-          ensure_dir_exists(d)
-          os.listdir(d) # hack to ensure that 
+          ensure_dir_exists(d, gfvol)
+          smallfile.gf_listdir(gfvol, d) # hack to ensure that 
           if verbose: print(host + ' saw ' + str(d))
 
   # for each thread set up smf_invocation instance,
@@ -61,7 +62,7 @@ def run_multi_thread_workload(prm):
   # to do this, look for thread-ready files 
 
   for t in thread_list:
-    ensure_deleted(t.invoke.gen_thread_ready_fname(t.invoke.tid))
+    ensure_deleted(t.invoke.gen_thread_ready_fname(t.invoke.tid), gfvol)
   for t in thread_list:
     t.start()
   if verbose: print("started %d worker threads on host %s"%(len(thread_list),host))
@@ -76,23 +77,26 @@ def run_multi_thread_workload(prm):
   abort_fname = my_host_invoke.abort_fn()
   threads_ready = False  # really just to set scope of variable
   k=0
+  #import pdb;pdb.set_trace()
   for sec in range(0, startup_timeout*2):
-    os.listdir(t.invoke.network_dir) # hack to ensure that directory is up to date
+    smallfile.gf_listdir(gfvol, t.invoke.network_dir) # hack to ensure that directory is up to date
     threads_ready = True
     for t in thread_list:
         fn = t.invoke.gen_thread_ready_fname(t.invoke.tid)
-        if not os.path.exists(fn): 
+        #if not os.path.exists(fn): 
+        if not smallfile.gf_exists(gfvol, fn): 
             threads_ready = False
             break
     if threads_ready: break
-    if os.path.exists(abort_fname): break
+    #if os.path.exists(abort_fname): break
+    if smallfile.gf_exists(gfvol, abort_fname): break
     if verbose: print('threads not ready...')
     time.sleep(0.5)
 
   # if all threads didn't make it to the starting gate
 
   if not threads_ready: 
-    abort_test(abort_fname, thread_list)
+    abort_test(abort_fname, thread_list, gfvol)
     raise Exception('threads did not reach starting gate within %d sec'%startup_timeout)
 
   # declare that this host is at the starting gate
@@ -100,7 +104,7 @@ def run_multi_thread_workload(prm):
   if prm_slave:
     host_ready_fn = my_host_invoke.gen_host_ready_fname()
     if my_host_invoke.verbose: print('host %s creating ready file %s'%(my_host_invoke.onhost, host_ready_fn))
-    smallfile.touch(host_ready_fn)
+    smallfile.touch(host_ready_fn, gfvol)
 
   sg = my_host_invoke.starting_gate
   if not prm_slave: # special case of no --host-set parameter
@@ -116,13 +120,13 @@ def run_multi_thread_workload(prm):
   if verbose: print('awaiting '+sg)
   if prm_slave:
     for sec in range(0, startup_timeout*2):
-      ndlist = os.listdir(my_host_invoke.network_dir) # hack to ensure that directory is up to date
+      ndlist = smallfile.gf_listdir(gfvol, my_host_invoke.network_dir) # hack to ensure that directory is up to date
       if verbose: print(str(ndlist))
-      if os.path.exists(sg):
+      if smallfile.gf_exists(gfvol, sg):
         break
       time.sleep(0.5)
-    if not os.path.exists(sg):
-      abort_test(my_host_invoke.abort_fn(), thread_list)
+    if not smallfile.gf_exists(gfvol, sg):
+      abort_test(my_host_invoke.abort_fn(), thread_list, gfvol)
       raise Exception('starting signal not seen within %d seconds'%startup_timeout)
   if verbose: print("starting test on host " + host + " in 2 seconds")
   time.sleep(2 + random.random())  
